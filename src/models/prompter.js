@@ -13,6 +13,9 @@ import { selectAPI, createModel } from './_model_map.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Stands in for $COMMAND_DOCS when commands are sent as native tools.
+const TOOL_MODE_COMMAND_NOTE = '\n*COMMANDS\nYour commands are provided as tools. To act, call the matching tool with its arguments instead of writing the command in your reply. You can call several tools in one response. Reply in plain text when no action is needed.\n*\n';
+
 export class Prompter {
     constructor(agent, profile) {
         this.agent = agent;
@@ -283,7 +286,10 @@ export class Prompter {
             return empty;
         }
 
-        let prompt = this.profile.conversing;
+        // The tool schemas already carry every command's description and params, so
+        // swap the text command reference for a short note rather than sending the
+        // same docs twice (several thousand tokens per request).
+        let prompt = this.profile.conversing.replaceAll('$COMMAND_DOCS', TOOL_MODE_COMMAND_NOTE);
         prompt = await this.replaceStrings(prompt, messages, this.convo_examples);
         const tools = getCommandTools(this.agent);
 

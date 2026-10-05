@@ -318,62 +318,57 @@ export class Agent {
             if (checkInterrupt()) break;
             let history = this.history.getHistory();
 
-            // Native tool-calling path (e.g. LM Studio / OpenAI-compatible local
-            // servers). Gated by settings.native_tool_calling and the model's
-            // capability; everything below this block is the unchanged !command DSL
-            // path used when the flag is off or the model can't tool-call.
+            // Native tool-calling path (e.g. LM Studio / llama.cpp / other
+            // OpenAI-compatible local servers). Gated by settings.native_tool_calling
+            // and the model's capability. A reply with no tool calls falls through to
+            // the unchanged !command DSL handling below, so a command the model wrote
+            // as text still runs and a plain reply is routed as chat.
+            let res;
             if (settings.native_tool_calling && this.prompter.supportsToolCalls()) {
                 const result = await this.prompter.promptConvoTools(history);
                 const content = (result.content || '').trim();
                 const tool_calls = result.tool_calls || [];
 
-                if (tool_calls.length === 0) {
-                    // no tool requested -> a real stop signal (abstention / conversation),
-                    // not the fragile "respond with a tab" heuristic the DSL path relies on
-                    if (content.length === 0) {
-                        console.warn('no response');
-                        break;
+                if (tool_calls.length > 0) {
+                    // one assistant turn: any spoken content + the call(s) rendered in
+                    // canonical !command form, so history stays uniform with the DSL path
+                    const called_str = tool_calls.map(tc => toCommandString(tc.name, tc.args)).join(' ');
+                    const assistant_text = (content.length > 0 ? content + ' ' : '') + called_str;
+                    this.history.add(this.name, assistant_text);
+
+                    if (content.length > 0)
+                        this.routeResponse(source, content);
+                    else if (settings.show_command_syntax !== 'none')
+                        this.routeResponse(source, `*used ${tool_calls.map(tc => tc.name).join(', ')}*`);
+
+                    let stop_loop = false;
+                    for (let tc of tool_calls) { // execute all calls (supports parallel/multi-step)
+                        if (checkInterrupt()) { stop_loop = true; break; }
+                        if (!commandExists('!' + tc.name)) {
+                            this.history.add('system', `Command !${tc.name} does not exist.`);
+                            console.warn('Agent hallucinated command:', tc.name);
+                            continue;
+                        }
+                        this.self_prompter.handleUserPromptedCmd(self_prompt, isAction('!' + tc.name));
+                        let execute_res = await executeToolCall(this, tc.name, tc.args);
+                        console.log('Agent executed (tool):', tc.name, 'and got:', execute_res);
+                        used_command = true;
+                        if (execute_res)
+                            this.history.add('system', execute_res);
+                        else
+                            stop_loop = true; // falsy result (e.g. !stop) ends the loop, mirroring the DSL path
                     }
-                    this.history.add(this.name, content);
-                    this.routeResponse(source, content);
-                    break;
+
+                    this.history.save();
+                    if (stop_loop) break;
+                    continue;
                 }
 
-                // one assistant turn: any spoken content + the call(s) rendered in
-                // canonical !command form, so history stays uniform with the DSL path
-                const called_str = tool_calls.map(tc => toCommandString(tc.name, tc.args)).join(' ');
-                const assistant_text = (content.length > 0 ? content + ' ' : '') + called_str;
-                this.history.add(this.name, assistant_text);
-
-                if (content.length > 0)
-                    this.routeResponse(source, content);
-                else if (settings.show_command_syntax !== 'none')
-                    this.routeResponse(source, `*used ${tool_calls.map(tc => tc.name).join(', ')}*`);
-
-                let stop_loop = false;
-                for (let tc of tool_calls) { // execute all calls (supports parallel/multi-step)
-                    if (checkInterrupt()) { stop_loop = true; break; }
-                    if (!commandExists('!' + tc.name)) {
-                        this.history.add('system', `Command !${tc.name} does not exist.`);
-                        console.warn('Agent hallucinated command:', tc.name);
-                        continue;
-                    }
-                    this.self_prompter.handleUserPromptedCmd(self_prompt, isAction('!' + tc.name));
-                    let execute_res = await executeToolCall(this, tc.name, tc.args);
-                    console.log('Agent executed (tool):', tc.name, 'and got:', execute_res);
-                    used_command = true;
-                    if (execute_res)
-                        this.history.add('system', execute_res);
-                    else
-                        stop_loop = true; // falsy result (e.g. !stop) ends the loop, mirroring the DSL path
-                }
-
-                this.history.save();
-                if (stop_loop) break;
-                continue;
+                res = content; // no tool calls: handled as text below
             }
-
-            let res = await this.prompter.promptConvo(history);
+            else {
+                res = await this.prompter.promptConvo(history);
+            }
 
             console.log(`${this.name} full response to ${source}: ""${res}""`);
 

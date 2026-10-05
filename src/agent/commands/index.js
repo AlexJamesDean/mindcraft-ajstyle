@@ -283,14 +283,16 @@ function paramToJsonSchema(param) {
     else if (param.type === 'ItemName') desc += ' (must be a valid Minecraft item name)';
     else if (param.type === 'BlockOrItemName') desc += ' (must be a valid Minecraft block or item name)';
     if (param.domain) {
-        const lower = param.domain[0];
-        const upper = param.domain[1];
-        if (upper === Infinity || upper === Number.MAX_VALUE)
-            desc += ` Minimum: ${lower}.`;
-        else if (lower === -Infinity)
-            desc += ` Maximum: ${upper}.`;
-        else
-            desc += ` Valid range: ${lower} to ${upper}.`;
+        // domain is [lower, upper, endpoints], endpoints defaulting to '[)'.
+        // Skip unbounded ends (Infinity / MAX_SAFE_INTEGER) so the model isn't
+        // shown noise like "1 to 9007199254740991".
+        const [lower, upper, endpoints = '[)'] = param.domain;
+        const bounded = v => Number.isFinite(v) && Math.abs(v) < Number.MAX_SAFE_INTEGER;
+        const limits = [];
+        if (bounded(lower)) limits.push(`${endpoints[0] === '(' ? 'greater than' : 'at least'} ${lower}`);
+        if (bounded(upper)) limits.push(`${endpoints[1] === ']' ? 'at most' : 'less than'} ${upper}`);
+        if (limits.length > 0)
+            desc += ` Must be ${limits.join(' and ')}.`;
     }
     schema.description = desc.trim();
     return schema;
