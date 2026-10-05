@@ -49,6 +49,7 @@ const settings = {
     "max_messages": 15, // max number of messages to keep in context
     "num_examples": 2, // number of examples to give to the model
     "max_commands": -1, // max number of commands that can be used in consecutive responses. -1 for no limit
+    "native_tool_calling": false, // EXPERIMENTAL: use native OpenAI-style tool calling (e.g. LM Studio / OpenAI-compatible local servers) instead of the !command text DSL. Automatically falls back to the DSL for any model/provider that doesn't implement tool calls.
     "show_command_syntax": "full", // "full", "shortened", or "none"
     "narrate_behavior": true, // chat simple automatic actions ('Picking up item!')
     "chat_bot_messages": true, // publicly chat messages to other bots

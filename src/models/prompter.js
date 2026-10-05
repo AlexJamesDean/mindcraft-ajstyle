@@ -1,6 +1,6 @@
 import { readFileSync, mkdirSync, writeFileSync} from 'fs';
 import { Examples } from '../utils/examples.js';
-import { getCommandDocs } from '../agent/commands/index.js';
+import { getCommandDocs, getCommandTools } from '../agent/commands/index.js';
 import { SkillLibrary } from "../agent/library/skill_library.js";
 import { stringifyTurns } from '../utils/text.js';
 import { getCommand } from '../agent/commands/index.js';
@@ -12,6 +12,9 @@ import { selectAPI, createModel } from './_model_map.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Stands in for $COMMAND_DOCS when commands are sent as native tools.
+const TOOL_MODE_COMMAND_NOTE = '\n*COMMANDS\nYour commands are provided as tools. To act, call the matching tool with its arguments instead of writing the command in your reply. You can call several tools in one response. Reply in plain text when no action is needed.\n*\n';
 
 export class Prompter {
     constructor(agent, profile) {
@@ -259,6 +262,52 @@ export class Prompter {
         }
 
         return '';
+    }
+
+    // Whether the active chat model can do native (OpenAI-style) tool calling.
+    // Detected by capability (the model class implements sendToolRequest) so any
+    // provider that doesn't gracefully falls back to the !command DSL.
+    supportsToolCalls() {
+        return typeof this.chat_model.sendToolRequest === 'function';
+    }
+
+    // Tool-calling counterpart to promptConvo. Builds the same system prompt but
+    // sends the command registry as native tools and returns the structured
+    // result { content, tool_calls, reasoning_content, finish_reason } instead of
+    // a parsed-from-text string. Single attempt: malformed/hallucinated commands
+    // are structurally prevented by the schema, and retrying could double-execute.
+    async promptConvoTools(messages) {
+        this.most_recent_msg_time = Date.now();
+        let current_msg_time = this.most_recent_msg_time;
+        const empty = { content: '', tool_calls: [], reasoning_content: null, finish_reason: 'stop' };
+
+        await this.checkCooldown();
+        if (current_msg_time !== this.most_recent_msg_time) {
+            return empty;
+        }
+
+        // The tool schemas already carry every command's description and params, so
+        // swap the text command reference for a short note rather than sending the
+        // same docs twice (several thousand tokens per request).
+        let prompt = this.profile.conversing.replaceAll('$COMMAND_DOCS', TOOL_MODE_COMMAND_NOTE);
+        prompt = await this.replaceStrings(prompt, messages, this.convo_examples);
+        const tools = getCommandTools(this.agent);
+
+        let result;
+        try {
+            result = await this.chat_model.sendToolRequest(messages, prompt, tools);
+            await this._saveLog(prompt, messages, JSON.stringify(result), 'conversation');
+        } catch (error) {
+            console.error('Error during tool-calling generation:', error);
+            return empty;
+        }
+
+        if (current_msg_time !== this.most_recent_msg_time) {
+            console.warn(`${this.agent.name} received new message while generating, discarding old response.`);
+            return empty;
+        }
+
+        return result || empty;
     }
 
     async promptCoding(messages) {

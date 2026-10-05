@@ -257,3 +257,176 @@ export function getCommandDocs(agent) {
     }
     return docs + '*\n';
 }
+
+/**
+ * Converts a single mindcraft command param definition into a JSON-Schema property,
+ * for native (OpenAI-style) tool calling. The richer mindcraft types (BlockName,
+ * domains, etc.) collapse to JSON-Schema primitives, but their constraints are
+ * preserved in the description so the model still gets the guidance.
+ * @param {Object} param - a command param definition: { type, description, domain? }
+ * @returns {Object} a JSON-Schema property object
+ */
+function paramToJsonSchema(param) {
+    let schema = {};
+    switch (param.type) {
+        case 'int':
+            schema.type = 'integer'; break;
+        case 'float':
+            schema.type = 'number'; break;
+        case 'boolean':
+            schema.type = 'boolean'; break;
+        default: // string, BlockName, ItemName, BlockOrItemName
+            schema.type = 'string'; break;
+    }
+    let desc = param.description || '';
+    if (param.type === 'BlockName') desc += ' (must be a valid Minecraft block name)';
+    else if (param.type === 'ItemName') desc += ' (must be a valid Minecraft item name)';
+    else if (param.type === 'BlockOrItemName') desc += ' (must be a valid Minecraft block or item name)';
+    if (param.domain) {
+        // domain is [lower, upper, endpoints], endpoints defaulting to '[)'.
+        // Skip unbounded ends (Infinity / MAX_SAFE_INTEGER) so the model isn't
+        // shown noise like "1 to 9007199254740991".
+        const [lower, upper, endpoints = '[)'] = param.domain;
+        const bounded = v => Number.isFinite(v) && Math.abs(v) < Number.MAX_SAFE_INTEGER;
+        const limits = [];
+        if (bounded(lower)) limits.push(`${endpoints[0] === '(' ? 'greater than' : 'at least'} ${lower}`);
+        if (bounded(upper)) limits.push(`${endpoints[1] === ']' ? 'at most' : 'less than'} ${upper}`);
+        if (limits.length > 0)
+            desc += ` Must be ${limits.join(' and ')}.`;
+    }
+    schema.description = desc.trim();
+    return schema;
+}
+
+/**
+ * Builds an OpenAI-compatible `tools` array from the live command registry,
+ * honoring the agent's blocked_actions. Each non-blocked command becomes a
+ * function tool whose name is the command name without the leading '!'.
+ * This is the native-tool-calling analogue of getCommandDocs().
+ * @param {Object} agent
+ * @returns {Object[]} tools array suitable for the OpenAI `tools` request field
+ */
+export function getCommandTools(agent) {
+    const tools = [];
+    for (let command of commandList) {
+        if (agent.blocked_actions.includes(command.name)) {
+            continue;
+        }
+        const properties = {};
+        const required = [];
+        if (command.params) {
+            for (let paramName in command.params) {
+                properties[paramName] = paramToJsonSchema(command.params[paramName]);
+                // mindcraft commands have no optional params (the DSL requires an exact
+                // arg count), so every declared param is required.
+                required.push(paramName);
+            }
+        }
+        tools.push({
+            type: 'function',
+            function: {
+                name: command.name.substring(1), // strip leading '!'
+                description: command.description,
+                parameters: {
+                    type: 'object',
+                    properties,
+                    required,
+                    additionalProperties: false
+                }
+            }
+        });
+    }
+    return tools;
+}
+
+/**
+ * Renders a tool call back into the canonical !command(args) text, so the
+ * tool-calling path and the DSL path produce identical-looking history/chat
+ * entries (keeps memory summarization and the model's reading of past turns
+ * uniform regardless of which path produced them).
+ * @param {string} toolName - command name with or without leading '!'
+ * @param {Object} argsObj - arguments keyed by param name
+ * @returns {string}
+ */
+export function toCommandString(toolName, argsObj) {
+    const commandName = toolName.startsWith('!') ? toolName : '!' + toolName;
+    const command = getCommand(commandName);
+    if (!command) return commandName;
+    const paramNames = commandParamNames(command);
+    if (paramNames.length === 0) return commandName;
+    const parts = paramNames.map(name => {
+        let v = argsObj ? argsObj[name] : undefined;
+        if (typeof v === 'string') return `"${v}"`;
+        return `${v}`;
+    });
+    return `${commandName}(${parts.join(', ')})`;
+}
+
+/**
+ * Executes a native tool call (structured args keyed by param name) against the
+ * command registry. Performs the same type coercion / domain / block-item
+ * validation as parseCommandMessage, but starting from already-typed JSON args
+ * rather than regex-parsed text. Returns the command's result string, or an
+ * error string the model can recover from (never throws on bad input).
+ * @param {Object} agent
+ * @param {string} toolName - command name with or without leading '!'
+ * @param {Object} argsObj - arguments keyed by param name
+ * @returns {Promise<string|void>}
+ */
+export async function executeToolCall(agent, toolName, argsObj) {
+    const commandName = toolName.startsWith('!') ? toolName : '!' + toolName;
+    const command = getCommand(commandName);
+    if (!command) return `Command ${commandName} does not exist.`;
+
+    const params = commandParams(command);
+    const paramNames = commandParamNames(command);
+    const args = [];
+
+    for (let i = 0; i < params.length; i++) {
+        const param = params[i];
+        const name = paramNames[i];
+        let arg = argsObj ? argsObj[name] : undefined;
+        if (arg === undefined || arg === null)
+            return `Error: Missing required parameter '${name}' for ${commandName}.`;
+
+        switch (param.type) {
+            case 'int':
+                arg = Number.parseInt(arg); break;
+            case 'float':
+                arg = Number.parseFloat(arg); break;
+            case 'boolean':
+                arg = typeof arg === 'string' ? parseBoolean(arg) : Boolean(arg); break;
+            case 'BlockName':
+            case 'BlockOrItemName':
+            case 'ItemName':
+                arg = String(arg);
+                if (arg.endsWith('plank') || arg.endsWith('seed'))
+                    arg += 's'; // common mistakes like "oak_plank" or "wheat_seed"
+                break;
+            case 'string':
+                arg = String(arg); break;
+            default:
+                return `Command '${commandName}' parameter '${name}' has an unknown type: ${param.type}.`;
+        }
+
+        if (arg === null || (typeof arg === 'number' && Number.isNaN(arg)))
+            return `Error: Param '${name}' must be of type ${param.type}.`;
+
+        if (typeof arg === 'number' && param.domain) {
+            const domain = param.domain;
+            if (!domain[2]) domain[2] = '[)';
+            if (!checkInInterval(arg, ...domain))
+                return `Error: Param '${name}' must be an element of ${domain[2][0]}${domain[0]}, ${domain[1]}${domain[2][1]}.`;
+        } else if (param.type === 'BlockName') {
+            if (getBlockId(arg) == null) return `Invalid block type: ${arg}.`;
+        } else if (param.type === 'ItemName') {
+            if (getItemId(arg) == null) return `Invalid item type: ${arg}.`;
+        } else if (param.type === 'BlockOrItemName') {
+            if (getBlockId(arg) == null && getItemId(arg) == null) return `Invalid block or item type: ${arg}.`;
+        }
+
+        args.push(arg);
+    }
+
+    return await command.perform(agent, ...args);
+}
